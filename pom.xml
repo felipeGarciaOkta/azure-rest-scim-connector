@@ -1,0 +1,155 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+	<parent>
+		<groupId>org.springframework.boot</groupId>
+		<artifactId>spring-boot-starter-parent</artifactId>
+		<version>3.5.5</version>
+		<relativePath/> <!-- lookup parent from repository -->
+	</parent>
+	<groupId>com.okta</groupId>
+	<artifactId>AzureConnector-scim</artifactId>
+	<version>0.0.1-SNAPSHOT</version>
+	<name>AzureConnector</name>
+	<packaging>war</packaging>
+	<description>vmware vCenter SCIM project</description>
+	<url/>
+	<licenses>
+		<license/>
+	</licenses>
+	<developers>
+		<developer/>
+	</developers>
+	<scm>
+		<connection/>
+		<developerConnection/>
+		<tag/>
+		<url/>
+	</scm>
+	<properties>
+		<java.version>21</java.version>
+	</properties>
+	<dependencies>
+		<!-- Okta OPA Explorer JAR — handles OPA authentication, JWE secret retrieval,
+		     and auto-discovery. Config read from /run/config/oktaopaapiexplorer.config -->
+		<dependency>
+			<groupId>com.example</groupId>
+			<artifactId>okta-opa-explorer</artifactId>
+			<version>1.0-SNAPSHOT</version>
+			<scope>system</scope>
+			<systemPath>${project.basedir}/libs/okta-opa-explorer-1.0-SNAPSHOT.jar</systemPath>
+		</dependency>
+
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-web</artifactId>
+			<exclusions>
+				<exclusion>
+					<groupId>org.springframework.boot</groupId>
+					<artifactId>spring-boot-starter-logging</artifactId>
+				</exclusion>
+			</exclusions>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-actuator</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-test</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.mockito</groupId>
+			<artifactId>mockito-inline</artifactId>
+			<version>5.2.0</version>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.apache.logging.log4j</groupId>
+			<artifactId>log4j-api</artifactId>
+			<version>2.25.2</version>
+		</dependency>
+		<dependency>
+			<groupId>org.apache.logging.log4j</groupId>
+			<artifactId>log4j-core</artifactId>
+			<version>2.25.2</version>
+		</dependency>
+		<!-- Bridge SLF4J to Log4j (optional for Spring Boot apps) -->
+		<dependency>
+			<groupId>org.apache.logging.log4j</groupId>
+			<artifactId>log4j-slf4j2-impl</artifactId>
+			<version>2.25.2</version>
+		</dependency>
+		<dependency>
+			<groupId>com.squareup.okhttp3</groupId>
+			<artifactId>okhttp</artifactId>
+			<version>4.12.0</version>
+		</dependency>
+		<dependency>
+			<groupId>org.json</groupId>
+			<artifactId>json</artifactId>
+			<version>20250517</version>
+		</dependency>
+		<dependency>
+			<groupId>org.jasypt</groupId>
+			<artifactId>jasypt</artifactId>
+			<version>1.9.3</version>
+		</dependency>
+	</dependencies>
+	<build>
+		<finalName>connector-azure</finalName>
+		<plugins>
+			<plugin>
+				<groupId>org.springframework.boot</groupId>
+				<artifactId>spring-boot-maven-plugin</artifactId>
+				<configuration>
+					<includeSystemScope>true</includeSystemScope>
+				</configuration>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-surefire-plugin</artifactId>
+				<configuration>
+					<!-- Several test classes (OpaConfigPreprocessorAdditionalTest,
+					     ConnectorRestConfigLoaderAdditionalTest) statically mock
+					     java.nio.file.Files via Mockito's inline mock maker, which
+					     instruments a core JDK platform class. Sharing one JVM fork
+					     across test classes risks that instrumentation state leaking
+					     into later, unrelated classes' reflection (observed as
+					     "Could not find field" errors in ConnectorRestConfigLoaderTest
+					     on some JDK builds). Giving each test class its own fork
+					     removes that risk. -->
+					<reuseForks>false</reuseForks>
+				</configuration>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-war-plugin</artifactId>
+				<configuration>				<finalName>connector-azure</finalName>					<webResources>
+						<resource>
+							<directory>${project.basedir}/src/main/java</directory>
+							<targetPath>sources/src/main/java</targetPath>
+						</resource>
+						<resource>
+							<directory>${project.basedir}/src/main/resources</directory>
+							<targetPath>sources/src/main/resources</targetPath>
+						</resource>
+						<resource>
+							<directory>${project.basedir}</directory>
+							<targetPath>sources</targetPath>
+							<includes>
+								<include>pom.xml</include>
+								<include>REST_CONNECTOR_CONFIG_GUIDE.md</include>
+								<include>IMPLEMENTATION_SUMMARY.md</include>
+								<include>connector-azure-okta-config.example.json</include>
+								<include>HELP.md</include>
+							</includes>
+						</resource>
+					</webResources>
+				</configuration>
+			</plugin>
+		</plugins>
+	</build>
+</project>
