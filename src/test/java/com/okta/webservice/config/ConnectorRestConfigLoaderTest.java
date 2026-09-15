@@ -34,6 +34,24 @@ class ConnectorRestConfigLoaderTest {
     @TempDir
     Path tempDir;
 
+    // TEMPORARY DIAGNOSTIC — remove once the "Could not find field" mystery is
+    // resolved. Every prior theory (stale build artifacts, vendored-jar class
+    // shadowing, shared Surefire forks) was checked and ruled out. This prints
+    // ground truth from the actual failing JVM instead of guessing again:
+    // which fields the runtime class really has, and where that class was
+    // actually loaded from (target/classes vs some jar on the classpath).
+    @org.junit.jupiter.api.BeforeAll
+    static void logRuntimeClassDiagnostics() {
+        Class<?> cls = ConnectorRestConfigLoader.class;
+        System.out.println("[DIAG] declared fields: " + java.util.Arrays.toString(cls.getDeclaredFields()));
+        System.out.println("[DIAG] classloader: " + cls.getClassLoader());
+        try {
+            System.out.println("[DIAG] loaded from: " + cls.getProtectionDomain().getCodeSource().getLocation());
+        } catch (Exception e) {
+            System.out.println("[DIAG] could not determine code source: " + e);
+        }
+    }
+
     @Test
     void loadConfigUsesLocalFileFallback() throws Exception {
         ConnectorRestConfigLoader loader = new ConnectorRestConfigLoader();
