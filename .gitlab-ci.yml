@@ -1,0 +1,671 @@
+include:
+- project: devops/job-templates
+  ref: v3.0.0
+  file: artifactory-jobs.yml
+- project: devops/job-templates
+  ref: v3.0.0
+  file: java-jobs.yml
+- project: devops/job-templates
+  ref: v3.0.0
+  file: change-jobs.yml
+- project: devops/job-templates
+  ref: v3.0.0
+  file: test-jobs.yml
+- project: devops/job-templates
+  ref: v3.0.0
+  file: security-jobs.yml
+- project: devops/job-templates
+  ref: v3.0.0
+  file: deploy-jobs.yml
+- project: devops/cicd-constructs
+  ref: v3.0.0
+  file: cicd-constructs.yml  
+- project: devops/cicd-constructs
+  ref: v3.0.0
+  file: mandatory-extends.yml
+- project: devops/image-template
+  ref: main
+  file: images-jobs.yml
+
+stages:
+  - build
+  - verify-build
+  - pre-deploy
+  - deploy
+  - validate-deploy
+  - rollback
+  - plx-integeration
+  - publish-artifact
+  - retrieve-artifact
+  - predeploy-prod
+  - deploy-prod
+  - validate-deploy-prod
+  - rollback-prod
+  - plx-integeration-prod
+
+variables:
+  MANIFEST_FILE: k8s_configs/manifest.yml
+  AUTOSCALE_FILE: k8s_configs/autoscale.json
+  TARGET: target
+  MAVEN_OPTS: -Dmaven.repo.local=.m2/repository -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=WARN -Dorg.slf4j.simpleLogger.showDateTime=true -Djava.awt.headless=true
+  MAVEN_CLI_OPTS: --batch-mode --errors
+  DOMAIN_NP: r1.pcf.dell.com
+  GTM_DOMAIN: ${GTM_DOMAIN}
+  DOMAIN_PRI: ${DOMAIN_PRI}
+  DOMAIN_SEC: ${DOMAIN_SEC}
+  JAVA_JDK_IMAGE: $JAVA_21_JDK_IMG
+  PROPERTIES_FILE: src/main/resources/application.properties
+  KUBECTL_IMAGE: "harbor.dell.com/devops-images/deb-docker-devops/20-ce:latest"
+  APP_NAME: Azure-connector-deployment
+  OKTA_VAULT_NAMESPACE: 1011273
+
+.fetch-secret: &fetchSecret
+  - wget https://artifacts.dell.com/artifactory/hvault-1001095-generic-dev-local/hashicorp/vault/1.12.1/vault_1.12.1+ent_linux_amd64.zip -O ./vault-enterprise_1.8.3%2Bprem_linux_amd64.zip
+  - unzip ./vault-enterprise_1.8.3%2Bprem_linux_amd64.zip
+  - cp ./vault /usr/local/bin
+  - export VAULT_NAMESPACE=$VAULT_NAMESPACE
+  - echo "Vault jwt id token rolw is -- $VAULT_JWT_IDTOKEN_ROLE"
+  - echo "Vault jwt id token path is -- $VAULT_JWT_IDTOKEN_PATH"
+  - echo "Vault jwt id token is -- $VAULT_ID_TOKEN"
+  - echo "Vault addr is $VAULT_ADDR"
+  - echo "Vault cofig path is -- $VAULT_CONFIG_PATH"
+  - export VAULT_TOKEN=$(vault write -field=token auth/$VAULT_JWT_IDTOKEN_PATH/login role=$VAULT_JWT_IDTOKEN_ROLE jwt=$VAULT_ID_TOKEN)
+  - export kob_auth_endpoint="$(vault kv get -field=AUTH_ENDPOINT $VAULT_CONFIG_PATH)"
+  - export kob_cluster="$(vault kv get -field=CLUSTER $VAULT_CONFIG_PATH)"
+  - export kob_namespace="$(vault kv get -field=NAMESPACE $VAULT_CONFIG_PATH)"
+  - export kob_password="$(vault kv get -field=PASSWORD $VAULT_CONFIG_PATH)"
+  - export kob_username="$(vault kv get -field=USERNAME $VAULT_CONFIG_PATH)"
+  - echo $kob_auth_endpoint
+  - echo $kob_cluster
+  - echo $kob_namespace
+  - echo $kob_username
+
+.kobLogin: &kobLogin
+  - echo "$kob_password" | kob get-kubeconfig $kob_cluster -u $kob_username -a $kob_auth_endpoint -k
+  - kubectl config set-context --current --namespace=$kob_namespace
+  - kubectl config get-contexts
+  - kob -v
+
+.updatemanifest: &updatemanifest
+  # - export APP_NAME=$(grep "name:" "$MANIFEST_FILE" | head -n 1 | cut -d ':' -f2 | tr -d '[:space:]')
+  # - echo "APPNAME is ${APP_NAME}"  
+  - |
+    echo "updating manifest file $MANIFEST_FILE"
+    sed -i "s/((env))/$ENV/g" $MANIFEST_FILE
+    sed -i "s|((config-domain))|$CONFIG_DOMAIN|g" $MANIFEST_FILE
+    sed -i "s|((cluster-domain))|$CLUSTER_DOMAIN|g" $MANIFEST_FILE
+    sed -i "s|((app-name))|$APP_NAME|g" $MANIFEST_FILE
+    sed -i "s|((global-domain))|$GLOBAL_DOMAIN|g" $MANIFEST_FILE
+    sed -i "s|((instance-count))|$INSTANCE_COUNT|g" $MANIFEST_FILE
+    echo "updated manifest file"
+  - |
+    war_file_name=$(find target/*.war | head -n 1) && echo "$war_file_name" || true
+    jar_file_name=$(find target/*.jar | head -n 1) && echo "$jar_file_name" || true
+    if [[ -n $war_file_name ]]; then export jar_war_file=$war_file_name; fi
+    if [[ -n $jar_file_name ]]; then export jar_war_file=$jar_file_name; fi
+    escaped_jar_war_file=$(echo "$jar_war_file" | sed 's#/#\\/#g') && echo "$escaped_jar_war_file"
+    sed -i "s|((jar-war-file))|$escaped_jar_war_file|g" $MANIFEST_FILE
+    echo "jar-war-file updated"
+    cat $MANIFEST_FILE
+
+
+.updateApplicationPropeties: &updateApplicationProperties
+  - echo "updating application.properties file"
+  - sed -i "s|((cluster-domain))|$CLUSTER_DOMAIN|g" $PROPERTIES_FILE
+  - echo "updated application.properties file"
+  - cat src/main/resources/application.properties
+
+.id_tokens_prod: &id_tokens_prod
+  id_tokens:
+      VAULT_ID_TOKEN:
+        aud: $VAULT_ADDR
+
+.id_tokens_nonprod: &id_tokens_nonprod
+  id_tokens:
+      VAULT_ID_TOKEN:
+        aud: $NONPROD_VAULT_ADDR
+        
+
+.rules_common: &rules_common
+  rules:
+   - if: $CI_COMMIT_BRANCH =~ /^([fF]eature|[rR]elease).*$/
+   - if: $CI_COMMIT_BRANCH =~ /^([Mm]aster|[Mm]ain).*$/
+
+######################################################################################################################
+#                                                  BUILD JOBS
+#####################################################################################################################
+
+
+compile-build:
+  extends: .compile-package-maven
+  image: $JAVA_JDK_IMAGE
+  <<: *rules_common
+  stage: build
+  before_script:    
+    - cp -rf setting.xml /opt/maven/conf/settings.xml 
+  allow_failure: false
+
+.unit-test:
+  extends: .unit-test-maven
+  image: $JAVA_JDK_IMAGE
+  <<: *rules_common
+  stage: verify-build
+  allow_failure: true
+
+code-quality1:
+   stage: verify-build
+   extends: .code-quality
+   image: $JAVA_JDK_IMAGE
+   <<: *id_tokens_nonprod
+   before_script:
+     - export VAULT_ADDR=$NONPROD_VAULT_ADDR
+     - java -version
+     - javac -version
+   allow_failure: true
+   <<: *rules_common
+   variables:
+     SONAR_HOST: https://sonarqube.dell.com
+     SONAR_EXCLUSIONS: '**/*.xml, **/*.xlsm, **/*.xsd, **/*.css, **/*.less, **/*.scss, **/*.java'
+     SONAR_BRANCH: $CI_COMMIT_REF_NAME
+     SONAR_PROJECT_NAME: $CI_PROJECT_NAME
+     JAR_FILE: target/*.war
+     SONAR_LANG: maven
+
+sast:checkmarx1:
+  extends: .sast:checkmarx:incremental
+  <<: *id_tokens_prod
+  variables:
+    CX_PROJECT_NAME: CxServer\PAS\Application\IDS\$CI_PROJECT_NAME
+    CX_OPTIONS: '-SASTMedium 4 -LocationPathExclude "*test,*log,*mvn,*static" -LocationFilesExclude "*test,*tests"'
+
+  allow_failure: true
+  <<: *rules_common
+  stage: verify-build
+
+## x-ray scan job
+.xray-scan1:
+ extends: .xray-scan
+ <<: *id_tokens_nonprod
+ variables:
+   ARTIFACT_LANG: default
+   ARTIFACT_SECRET_PATH: kv/ARTIFACTORY
+   TARGET: target/maven-archiver/
+ before_script:
+   - export VAULT_ADDR=$NONPROD_VAULT_ADDR
+   - export VAULT_JWT_PATH=$VAULT_NP_JWT_PATH
+   - export VAULT_JWT_ROLE=$VAULT_NP_JWT_ROLE
+   - export VAULT_JWT_IDTOKEN_PATH=$VAULT_JWT_NP_IDTOKEN_PATH
+   - export VAULT_JWT_IDTOKEN_ROLE=$VAULT_JWT_NP_IDTOKEN_ROLE
+ allow_failure: false
+ <<: *rules_common
+ stage: verify-build
+
+sast-scan:
+  <<: *id_tokens_nonprod
+  extends: .sast-scan
+  allow_failure: true    
+
+sca-scan:
+  <<: *id_tokens_nonprod
+  extends: .sca-scan
+  image: harbor.dell.com/devops-images/debian-12/java-21-jdk:latest
+  allow_failure: true
+
+
+######################################################################################################################
+#                                                  DEPLOY JOBS
+#####################################################################################################################
+.vaultanchor: &vaultanchor
+  - export VAULT_ADDR=$NONPROD_VAULT_ADDR
+  - export VAULT_NAMESPACE=$OKTA_VAULT_NAMESPACE
+  - echo "vault namespace is -- $VAULT_NAMESPACE"
+
+.vaultanchorprod: &vaultanchorprod
+  - export PROD_VAULT_ADDR=$VAULT_ADDR
+  - export VAULT_NAMESPACE=$OKTA_VAULT_NAMESPACE
+  - echo "vault namespace is -- $VAULT_NAMESPACE"
+
+.predeployAnchor: &predeployAnchor
+    - kubectl get deployment/$APP_NAME
+    - echo $(kubectl get deployment/$APP_NAME -o jsonpath='{.spec.template.spec.containers[*].image}') >> rollback-image-$ENV.txt
+    - cat rollback-image-$ENV.txt
+
+.validateanchor: &validateanchor
+  - curl -v https://$APP_NAME.$CLUSTER_DOMAIN/actuator/health/liveness
+
+.rollbackAnchor: &rollbackAnchor
+  - export KOBACE_ARGS="$APP_NAME -f $MANIFEST_FILE"
+  - cp -r rollback-image-$ENV.txt kob-build-container.txt
+  - cp -r rollback-image-$ENV.txt kob-build-container-$ENV.txt
+  - cat kob-build-container.txt
+  - cat kob-build-container-$ENV.txt
+
+.commonvariables: &commonvariables
+  IS_BLUE_GREEN_DEPLOY: "false" 
+  TARGET_K8S_OBJECTS: $MANIFEST_FILE
+  KOBACE_MANIFEST_FILE: $MANIFEST_FILE
+  CONTAINER_TOOL: kob
+
+########################################################################################################################
+
+
+#                                                  DEV ENVIRONMENT JOBS 
+
+
+########################################################################################################################
+.dev_rules: &dev_rules
+  rules:
+   - if: $CI_COMMIT_BRANCH =~ /^([fF]eature|[Mm]ain).*$/
+
+.kobvariablesdev: &kobvariablesdev
+  ENV: dev
+  INSTANCE_COUNT: 1
+  GLOBAL_DOMAIN: "opa-dev.kob.dell.com"
+  VAULT_CONFIG_PATH: kv/KOB/opa-dev
+  CLUSTER_DOMAIN: "opa-dev-a4-np.kob.dell.com"
+  CONFIG_DOMAIN: $CLUSTER_DOMAIN
+  <<: *commonvariables
+
+pre-deploy-dev:
+  stage: pre-deploy
+  image: $KUBECTL_IMAGE
+  <<: *id_tokens_nonprod
+  <<: *dev_rules
+  variables:
+    <<: *kobvariablesdev
+  before_script:
+    - *vaultanchor
+    - *fetchSecret
+  script:
+    - *kobLogin
+    - *predeployAnchor
+  artifacts:
+    paths:
+      - rollback-image-$ENV.txt
+  allow_failure: true
+  tags: 
+    - linux
+  
+# autoscale-deploy-dev:
+#   stage: pre-deploy
+#   image: $KUBECTL_IMAGE
+#   <<: *id_tokens_nonprod
+#   variables:
+#     <<: *kobvariablesdev
+#   before_script:
+#     - *vaultanchor
+#     - *fetchSecret
+#   script:
+#     - *kobLogin
+#     - kob delete-service autoscale-ids-$APP_NAME -f
+#     - kob create-user-provided-service autoscale-ids-$APP_NAME -f $AUTOSCALE_FILE
+#   allow_failure: true
+#   tags: 
+#     - linux
+
+k8s-kobace-deploy-dev:
+  extends: .deploy-k8s-kobace
+  needs: ["compile-build","pre-deploy-dev"]
+  <<: *dev_rules
+  <<: *id_tokens_nonprod
+  variables:
+    debug: true
+    <<: *kobvariablesdev
+  before_script:
+     - *vaultanchor
+     - *updatemanifest
+     - export KOBACE_ARGS="$APP_NAME -f $MANIFEST_FILE"
+
+validate-dev:
+  variables:
+    <<: *kobvariablesdev
+  before_script:
+    - *updatemanifest
+  script:
+    - *validateanchor
+  <<: *dev_rules
+  stage: validate-deploy
+  tags:
+    - linux
+
+plx-job-nonprod-dev:
+  stage: plx-integeration
+  needs: ["k8s-kobace-deploy-dev"]
+  extends:
+    - .plx-integration
+  <<: *id_tokens_nonprod
+  <<: *dev_rules
+  variables:
+    CUSTOM_APP_NAME: $APP_NAME
+    DT_CUSTOM_PROP: KOB_APPID=1011273 KOB_FOUNDATION=A4 KOB_ENVIRONMENT=NON-PROD APP_SHORT_NAME=$APP_NAME
+    <<: *kobvariablesdev
+  before_script:
+    - *vaultanchor
+    - *updatemanifest
+
+rollback-kobace-dev:
+  when: manual
+  stage: rollback
+  needs: ["pre-deploy-dev","k8s-kobace-deploy-dev"]
+  extends: .deploy-k8s-kobace
+  <<: *id_tokens_nonprod
+  <<: *dev_rules
+  variables:
+    <<: *kobvariablesdev
+  before_script:
+    - *vaultanchor
+    - *updatemanifest
+    - *rollbackAnchor
+
+
+########################################################################################################################
+
+
+#                                                  TEST ENVIRONMENT JOBS 
+
+
+########################################################################################################################
+# .testRules: &testRules
+#   rules:
+#    - if: $CI_COMMIT_BRANCH =~ /^([Rr]elease|[Mm]ain).*$/
+
+# .kobvariablestest: &kobvariablestest
+#   ENV: test
+#   INSTANCE_COUNT: 1
+#   GLOBAL_DOMAIN: "test-ids.kob.dell.com"
+#   VAULT_CONFIG_PATH: kv/KOB/TEST
+#   CLUSTER_DOMAIN: "test-ids-r4-np.kob.dell.com"
+#   CONFIG_DOMAIN: $CLUSTER_DOMAIN
+#   <<: *commonvariables
+
+# pre-deploy-test:
+#   stage: pre-deploy
+#   image: $KUBECTL_IMAGE
+#   <<: *id_tokens_nonprod
+#   <<: *testRules
+#   variables:
+#     <<: *kobvariablestest
+#   before_script:
+#     - *vaultanchor
+#     - *fetchSecret
+#   script:
+#     - *kobLogin
+#     - *predeployAnchor
+#   artifacts:
+#     paths:
+#       - rollback-image-$ENV.txt
+#   allow_failure: true
+#   tags: 
+#     - linux
+
+# k8s-kobace-deploy-test:
+#   extends: .deploy-k8s-kobace
+#   needs: ["compile-build", "pre-deploy-test"]
+#   <<: *id_tokens_nonprod
+#   <<: *testRules
+#   variables:
+#     debug: true
+#     <<: *kobvariablestest
+#   before_script:
+#      - *vaultanchor
+#      - *updatemanifest
+#      - export KOBACE_ARGS="$APP_NAME -f $MANIFEST_FILE"
+
+
+# validate-test:
+#   variables:
+#     <<: *kobvariablestest
+#   before_script:
+#     - *updatemanifest
+#   script:
+#     - *validateanchor
+#   <<: *testRules
+#   stage: validate-deploy
+#   tags:
+#     - linux
+
+# plx-job-nonprod-test:
+#   stage: plx-integeration
+#   needs: ["k8s-kobace-deploy-test"]
+#   extends:
+#     - .plx-integration
+#   <<: *id_tokens_nonprod
+#   <<: *testRules
+#   variables:
+#     CUSTOM_APP_NAME: $APP_NAME
+#     DT_CUSTOM_PROP: KOB_APPID=3144 KOB_FOUNDATION=R4 KOB_ENVIRONMENT=NON-PROD APP_SHORT_NAME=$APP_NAME
+#     <<: *kobvariablestest
+#   before_script:
+#     - *vaultanchor
+#     - *updatemanifest
+
+# rollback-kobace-test:
+#   when: manual
+#   stage: rollback
+#   needs: ["pre-deploy-test","k8s-kobace-deploy-test"]
+#   extends: .deploy-k8s-kobace
+#   <<: *id_tokens_nonprod
+#   <<: *testRules
+#   variables:
+#     <<: *kobvariablestest
+#   before_script:
+#     - *vaultanchor
+#     - *updatemanifest
+#     - *rollbackAnchor
+
+# publish-DCS:
+#   extends: .publish-artifact
+#   <<: *id_tokens_nonprod
+#   variables:
+#     UPLOAD_PATH: 'idsiam-3144-generic-dev-local/$CI_PROJECT_PATH'
+#     ARTIFACT_SECRET_PATH: "kv/ARTIFACTORY"
+#     CICD_ARTIFACTORY: https://artifacts.dell.com/artifactory
+#     UPLOAD_FILENAME: $CI_PROJECT_NAME-$CI_COMMIT_SHORT_SHA.tar.gz
+#     METADATA_FILENAME: "artifactory-jobs.yml"
+#   allow_failure: false
+#   before_script:
+#     - export VAULT_ADDR=$NONPROD_VAULT_ADDR
+#   <<: *testRules
+#   stage: publish-artifact
+
+# ########################################################################################################################
+
+
+# #                                                  PROD ENVIRONMENT JOBS 
+
+
+# ########################################################################################################################
+# .prod_rules: &prod_rules
+#   rules:
+#    - if: $CI_COMMIT_TAG
+
+# .kobvariablesprod: &kobvariablesprod
+#   ENV: prod
+#   INSTANCE_COUNT: 2
+#   GLOBAL_DOMAIN: "prod-ids.kob.dell.com"
+#   CONFIG_DOMAIN: $GLOBAL_DOMAIN
+#   <<: *commonvariables
+
+# .kobvariablesprodp3: &kobvariablesprodp3
+#   VAULT_CONFIG_PATH: kv/KOB/pc1-p3
+#   CLUSTER_DOMAIN: "prod-ids-p3.kob.dell.com"
+#   <<: *kobvariablesprod
+
+# .kobvariablesprods3: &kobvariablesprods3
+#   VAULT_CONFIG_PATH: kv/KOB/s3b-s3
+#   CLUSTER_DOMAIN: "prod-ids-s3.kob.dell.com"
+#   <<: *kobvariablesprod
+
+# retrieve-artifact:
+#   <<: *id_tokens_nonprod
+#   variables:
+#     UPLOAD_PATH: 'idsiam-3144-generic-dev-local/$CI_PROJECT_PATH'
+#     ARTIFACT_SECRET_PATH: "kv/ARTIFACTORY"
+#     CICD_ARTIFACTORY: https://artifacts.dell.com/artifactory
+#     UPLOAD_FILENAME: $CI_PROJECT_NAME-$CI_COMMIT_SHORT_SHA.tar.gz
+#     METADATA_FILENAME: "artifactory-jobs.yml"
+#   before_script:
+#     - export VAULT_ADDR=$NONPROD_VAULT_ADDR
+#   <<: *prod_rules
+#   when: manual
+#   extends: .retrieve-artifact
+#   allow_failure: false
+# ########################################################################################################################
+# #                                                  PROD S3 CLUSTER JOBS
+# ########################################################################################################################
+# pre-deploy-prod-s3:
+#   stage: predeploy-prod
+#   image: $KUBECTL_IMAGE
+#   needs: ["retrieve-artifact"]
+#   <<: *id_tokens_prod
+#   variables:
+#     <<: *kobvariablesprods3
+#   before_script:
+#     - *vaultanchorprod
+#     - *fetchSecret
+#   script:
+#     - *kobLogin
+#     - *predeployAnchor
+#   artifacts:
+#     paths:
+#       - rollback-image-$ENV.txt
+#   allow_failure: true
+#   tags: [linux]
+#   <<: *prod_rules
+
+
+# k8s-kobace-deploy-prod-s3:
+#   extends: .deploy-k8s-kobace-prod
+#   stage: deploy-prod
+#   needs: ["retrieve-artifact", "pre-deploy-prod-s3"]
+#   <<: *id_tokens_prod
+#   <<: *prod_rules
+#   variables:
+#     debug: true
+#     <<: *kobvariablesprods3
+#   before_script:
+#      - *vaultanchorprod
+#      - *updatemanifest
+#      - export KOBACE_ARGS="$APP_NAME -f $MANIFEST_FILE"
+
+# validate-prod-s3:
+#   variables:
+#     <<: *kobvariablesprods3
+#   before_script:
+#     - *updatemanifest
+#   script:
+#     - *validateanchor
+#   <<: *prod_rules
+#   stage: validate-deploy-prod
+#   tags:
+#     - linux
+
+# plx-job-prod-s3:
+#   stage: plx-integeration-prod
+#   needs: ["k8s-kobace-deploy-prod-s3"]
+#   extends:
+#     - .plx-integration
+#   <<: *id_tokens_prod
+#   <<: *prod_rules
+#   variables:
+#     CUSTOM_APP_NAME: $APP_NAME
+#     DT_CUSTOM_PROP: KOB_APPID=3144 KOB_FOUNDATION=R4 KOB_ENVIRONMENT=PROD APP_SHORT_NAME=$APP_NAME
+#     <<: *kobvariablesprods3
+#   before_script:
+#     - *vaultanchorprod
+#     - *updatemanifest
+
+# rollback-kobace-prod-s3:
+#   when: manual
+#   stage: rollback-prod
+#   needs: ["pre-deploy-prod-p3","k8s-kobace-deploy-prod-s3"]
+#   extends: .deploy-k8s-kobace-prod
+#   <<: *id_tokens_prod
+#   <<: *prod_rules
+#   variables:
+#     <<: *kobvariablesprods3
+#   before_script:
+#     - *vaultanchorprod
+#     - *updatemanifest
+#     - *rollbackAnchor
+
+  
+# ########################################################################################################################
+# #                                                  PROD P3 CLUSTER JOBS
+# ########################################################################################################################
+
+# pre-deploy-prod-p3:
+#   stage: predeploy-prod
+#   image: $KUBECTL_IMAGE
+#   needs: ["retrieve-artifact"]
+#   <<: *id_tokens_prod
+#   variables:
+#     <<: *kobvariablesprodp3
+#   before_script:
+#     - *vaultanchorprod
+#     - *fetchSecret
+#   script:
+#     - *kobLogin
+#     - *predeployAnchor
+#   artifacts:
+#     paths:
+#       - rollback-image-$ENV.txt
+#   allow_failure: true
+#   <<: *prod_rules
+#   tags: [linux]
+
+# k8s-kobace-deploy-prod-p3:
+#   extends: .deploy-k8s-kobace-prod
+#   stage: deploy-prod
+#   needs: ["retrieve-artifact", "pre-deploy-prod-p3"]
+#   <<: *id_tokens_prod
+#   <<: *prod_rules
+#   variables:
+#     debug: true
+#     <<: *kobvariablesprodp3
+#   before_script:
+#      - *vaultanchorprod
+#      - *updatemanifest
+#      - export KOBACE_ARGS="$APP_NAME -f $MANIFEST_FILE"
+
+# validate-prod-p3:
+#   variables:
+#     <<: *kobvariablesprodp3
+#   before_script:
+#     - *updatemanifest
+#   script:
+#     - *validateanchor
+#   <<: *prod_rules
+#   stage: validate-deploy-prod
+#   tags:
+#     - linux
+
+# plx-job-prod-p3:
+#   stage: plx-integeration-prod
+#   needs: ["k8s-kobace-deploy-prod-p3"]
+#   extends:
+#     - .plx-integration
+#   <<: *id_tokens_prod
+#   <<: *prod_rules
+#   variables:
+#     CUSTOM_APP_NAME: $APP_NAME
+#     DT_CUSTOM_PROP: KOB_APPID=3144 KOB_FOUNDATION=R4 KOB_ENVIRONMENT=PROD APP_SHORT_NAME=$APP_NAME
+#     <<: *kobvariablesprodp3
+#   before_script:
+#     - *vaultanchorprod
+#     - *updatemanifest
+
+# rollback-kobace-prod-p3:
+#   when: manual
+#   stage: rollback-prod
+#   needs: ["pre-deploy-prod-p3","k8s-kobace-deploy-prod-p3"]
+#   extends: .deploy-k8s-kobace-prod
+#   <<: *id_tokens_prod
+#   <<: *prod_rules
+#   variables:
+#     <<: *kobvariablesprodp3
+#   before_script:
+#     - *vaultanchorprod
+#     - *updatemanifest
+#     - *rollbackAnchor
+  
